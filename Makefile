@@ -5,7 +5,7 @@
 APP = basicfwd
 
 # all source are stored in SRCS-y
-SRCS-y := basicfwd.c
+SRCS-y := main.c
 
 PKGCONF ?= pkg-config
 
