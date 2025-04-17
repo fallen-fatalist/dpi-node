@@ -1,29 +1,31 @@
-#include <cstdlib>
 #include <rte_common.h>
 #include <rte_eal.h>
 #include <rte_errno.h>
 #include <rte_ethdev.h>
 #include <rte_ether.h>
+#include <rte_launch.h>
 #include <rte_lcore.h>
 #include <rte_mbuf.h>
 #include <rte_mbuf_core.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
 
 /* main.c: program launcher */
 
 // Port related constants
-#define RX_RING_DESC_NUM 1024
+#define RX_RING_DESC_NUM 128
 #define RX_QUEUE_NUM 1
-#define TX_RING_DESC_NUM 1024
+#define TX_RING_DESC_NUM 512
 #define TX_QUEUE_NUM 1
 #define BURST_SIZE 32
 
 // MBUF constants
-#define NUM_MBUFS 8191
-#define MBUF_CACHE_SIZE 250
+#define NUM_MBUFS 4095
+#define MBUF_CACHE_SIZE 256
 
+struct rte_mempool *mbuf_pool;
 
 
 /*
@@ -33,7 +35,7 @@
 
 /* Main functional part of port initialization. 8< */
 static inline int
-init_port(
+port_init(
 	uint16_t port_id, 
 	struct rte_mempool *mbuf_pool, 
 	uint16_t rx_ring_desc_num, 
@@ -93,8 +95,8 @@ init_port(
 
 	retval = rte_eth_dev_adjust_nb_rx_tx_desc(
 		port_id, 
-		&rx_queue_num,
-		 &tx_queue_num
+		&rx_ring_desc_num,
+		&tx_ring_desc_num
 	);
 
 	if (retval != 0) {
@@ -105,21 +107,14 @@ init_port(
 			nb_tx_desc: %" PRIu16" \
 			) failed: %s (error %d)\n",
              port_id, 
-			 rx_queue_num,
-			 tx_queue_num, 
+			 rx_ring_desc_num,
+			 tx_ring_desc_num, 
 			 rte_strerror(-retval), 
 			 retval
 		);
 		return retval;
 	}
 
-	/* Fetch Numa socket */
-	uint16_t numa_socket = rte_eth_dev_socket_id(port_id);
-	if (numa_socket == 0) {
-		printf("rte_eth_dev_socket_id(port %" PRIu16 ") failed: %s (error %d)\n",
-             port_id, rte_strerror(-retval), retval);
-		return retval;
-	}
 
 	/* Allocate RX queues for Ethernet Port */
 	rxconf = dev_info.default_rxconf;
@@ -129,7 +124,7 @@ init_port(
 			port_id, 
 			queue_counter, 
 			rx_ring_desc_num, 
-			numa_socket, 
+			rte_socket_id(), 
 			&rxconf,
 			mbuf_pool	
 		);
@@ -144,8 +139,8 @@ init_port(
 				 port_id, 
 				 queue_counter,
 				 rx_ring_desc_num,
-				 numa_socket,
-				 rte_strerror(-retval), 
+				 rte_socket_id(),
+				 rte_strerror(-rte_errno), 
 				 retval
 			);
 			return retval;
@@ -160,7 +155,7 @@ init_port(
 			port_id, 
 			queue_counter, 
 			tx_ring_desc_num,
-			numa_socket, 
+			rte_socket_id(), 
 			&txconf
 		);
 		if (retval != 0) {
@@ -174,8 +169,8 @@ init_port(
 				 port_id, 
 				 queue_counter,
 				 tx_ring_desc_num,
-				 numa_socket,
-				 rte_strerror(-retval), 
+				 rte_socket_id(),
+				 rte_strerror(-rte_errno), 
 				 retval
 			);
 			return retval;
@@ -196,22 +191,6 @@ init_port(
 		return retval;
 	}
 
-	/* Log the port */
-	struct rte_ether_addr eth_addr; 
-	retval = rte_eth_macaddr_get(port_id, &eth_addr);
-	if (retval != 0) {
-		printf(
-			"rte_eth_macaddr_get(\
-			port %" PRIu16 ") failed: %s (error %d)\n",
-			 port_id, 
-			 rte_strerror(-retval), 
-			 retval
-		);
-	} else {
-		printf("Port %" PRIu16 " MAC: %02" PRIx8 " %02" PRIx8 " %02" PRIx8
-		   " %02" PRIx8 " %02" PRIx8 " %02" PRIx8 "\n",
-		port_id, RTE_ETHER_ADDR_BYTES(&eth_addr));
-	}
 
 	/* Enable RX in promiscuous mode for the Ethernet device */
 	retval = rte_eth_promiscuous_enable(port_id);
@@ -225,36 +204,89 @@ init_port(
 		);
 	}
 
+	/* Log the port */
+	struct rte_ether_addr eth_addr; 
+	retval = rte_eth_macaddr_get(port_id, &eth_addr);
+	if (retval != 0) {
+		printf(
+			"rte_eth_macaddr_get(\
+			port %" PRIu16 ") failed: %s (error %d)\n",
+			 port_id, 
+			 rte_strerror(-retval), 
+			 retval
+		);
+	} else {
+		printf("Port %" PRIu16 " MAC: %02" PRIx8 " %02" PRIx8 " %02" PRIx8
+		   " %02" PRIx8 " %02" PRIx8 " %02" PRIx8 " initialized, promiscious mode enabled\n",
+		port_id, RTE_ETHER_ADDR_BYTES(&eth_addr));
+	}
+
 	return EXIT_SUCCESS;
 }
 
 
 
-static inline void
-forward(uint16_t rx_port, uint16_t tx_port) {
-    struct rte_mbuf *bufs[BURST_SIZE];
-    const uint16_t nb_rx = rte_eth_rx_burst(rx_port, 0, bufs, BURST_SIZE);
-    if (nb_rx > 0)
-    rte_eth_tx_burst(tx_port, 0, bufs, nb_rx);
-}
 
-static __rte_noreturn void
-lcore_rx_main(__rte_unused void *arg) {
-	for (;;)
-		forward(0, 1);
+
+static int
+lcore_main() {
+	uint16_t port;
+
+	/*
+	 * Chech that the port is on the same NUMA node as the pooling thread
+	 */
+	RTE_ETH_FOREACH_DEV(port)
+		if (rte_eth_dev_socket_id(port) >= 0 && 
+			rte_eth_dev_socket_id(port) !=
+			(int)rte_socket_id()
+		) {
+			printf("WARNING, port %u is on remote NUMA node to "
+			"polling thread.\n\tPerformance will "
+			"not be optimal.\n", port);		
+		}
+
+	printf("\nCore %u forwarding packets. [Ctrl+C to quit]\n",
+			rte_lcore_id());
+
+	/* Main loop */
+	for (;;) {
+				RTE_ETH_FOREACH_DEV(port) {
+
+			/* Get burst of RX packets, from first port of pair. */
+			struct rte_mbuf *bufs[BURST_SIZE];
+			const uint16_t nb_rx = rte_eth_rx_burst(0, 0,
+					bufs, BURST_SIZE);
+
+			if (unlikely(nb_rx == 0))
+				continue;
+
+			/* Send burst of TX packets, to second port of pair. */
+			const uint16_t nb_tx = rte_eth_tx_burst(1, 0,
+					bufs, nb_rx);
+
+			/* Free any unsent packets. */
+			if (unlikely(nb_tx < nb_rx)) {
+				uint16_t buf;
+				for (buf = nb_tx; buf < nb_rx; buf++)
+					rte_pktmbuf_free(bufs[buf]);
+			}
+		}
+	}
+	return 0;
 }
 
 
 int
 main(int argc, char **argv) {
-	int retval; 
 	unsigned ports_num;
+
+	int retval; 
 	uint16_t portid;
-	uint16_t numa_socket = rte_socket_id(); 
+
+
 
 	/* Environment Abstraction Layer initialization */
-	retval = rte_eal_init(argc, argv);
-	if (retval < 0) {
+	if ((retval = rte_eal_init(argc, argv)) < 0) {
 		rte_exit(EXIT_FAILURE, "Failed init EAL: \
 			 failed: %s\
 			 (error %d)",
@@ -262,11 +294,10 @@ main(int argc, char **argv) {
 			 retval
 		);
 	}
-
+	
 	/* Move arguments pointer and reduce number of arguments */
 	argc -= retval;
 	argv += retval;
-
 
 	/* Validate number of ports */
 	ports_num = rte_eth_dev_count_avail();
@@ -274,29 +305,42 @@ main(int argc, char **argv) {
 		rte_exit(EXIT_FAILURE, "Error: odd number of ports\n");
 	}
 
-
 	/* Allocate mempool to hold the mbuffers */
-	static struct rte_mempool *mbuf_pool;
 	mbuf_pool = rte_pktmbuf_pool_create(
 		"MBUF_POOL",
-		NUM_MBUFS * ports_num,
-		RTE_MBUF_DEFAULT_BUF_SIZE,
+		NUM_MBUFS,
+		MBUF_CACHE_SIZE,
 		0,
 		RTE_MBUF_DEFAULT_BUF_SIZE,
-		numa_socket
+		rte_socket_id()
 	);
 
 	if (mbuf_pool == NULL) {
-		rte_exit(EXIT_FAILURE, "Failed to create mempool, reason: %s, code %d.)\n", 
-			rte_strerror(-retval), 
-			rte_errno
-		);
+		perror("Cannot create mbuf pool");
+		return retval;
 	}
 
+	/* Initialize all ports */
+	RTE_ETH_FOREACH_DEV(portid)
+		if (port_init(portid, mbuf_pool,
+			 RX_RING_DESC_NUM,
+			  TX_RING_DESC_NUM,
+			   RX_QUEUE_NUM,
+			    TX_QUEUE_NUM) != 0
+			) 
+			rte_exit(
+			EXIT_FAILURE,
+			"Cannot init port %" PRIu16"\n",
+				portid
+			);
 
+	/* Launch lcore_main on all lcores */
+	// if ((retval= rte_eal_mp_remote_launch(lcore_main, NULL, CALL_MAIN )) != 0 ) {
+	// 	rte_exit(EXIT_FAILURE, "Error during lcores launch\n");
+	// }
 
+	/* Launch lcore_main on one lcore */
+	lcore_main();
 
-	init_port(0, mbuf_pool, RX_RING_DESC_NUM, TX_RING_DESC_NUM, RX_QUEUE_NUM, TX_QUEUE_NUM);
-	init_port(1, mbuf_pool, RX_RING_DESC_NUM, TX_RING_DESC_NUM, RX_QUEUE_NUM, TX_QUEUE_NUM);
-	rte_eal_mp_remote_launch(lcore_rx_main, NULL, CALL_MAIN);
 	return 0;
+}
